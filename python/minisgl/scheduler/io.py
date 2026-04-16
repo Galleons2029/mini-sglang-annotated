@@ -1,3 +1,18 @@
+"""
+io.py - Scheduler I/O 通信层
+
+本模块实现 Scheduler 与 Tokenizer/DeTokenizer 之间的 ZMQ 通信。
+
+通信拓扑：
+  Tokenizer → [ZMQ Pull] → Scheduler → [ZMQ Push] → DeTokenizer
+
+多 TP rank 时的广播机制：
+  Tokenizer → Rank0 → [ZMQ Pub/Sub] → Rank1, Rank2, ...
+  - Rank0 从 Tokenizer 接收消息，通过 Pub 广播给其他 rank
+  - 其他 rank 通过 Sub 接收消息
+  - 只有 Rank0 向 DeTokenizer 发送回复
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final, List

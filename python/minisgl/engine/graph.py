@@ -1,3 +1,23 @@
+"""
+graph.py - CUDA Graph 管理
+
+本模块实现 CUDA Graph 的捕获和重放，用于消除 decode 阶段的 kernel launch 开销。
+
+核心概念：
+1. GraphCaptureBuffer: 预分配的 GPU buffer，CUDA Graph 捕获时绑定的固定地址
+2. GraphRunner: 管理 CUDA Graph 的生命周期（捕获、重放、销毁）
+
+CUDA Graph 工作流程：
+1. 初始化时，为每个 batch_size 捕获一个 graph
+2. 捕获时使用 dummy 数据执行一次 forward
+3. 重放时只需 copy 真实数据到 buffer，然后 replay graph
+4. 所有 graph 共享同一个 memory pool 以减少显存占用
+
+batch_size 选择策略：
+- [1, 2, 4, 8, 16, ..., max_bs]（8 的倍数递增）
+- max_bs 根据可用显存自动确定（80GB+ → 256，否则 → 160）
+"""
+
 from __future__ import annotations
 
 import gc
@@ -19,10 +39,17 @@ logger = init_logger(__name__)
 
 @dataclass
 class GraphCaptureBuffer:
+    """
+    CUDA Graph 捕获时的固定地址 buffer
+
+    CUDA Graph 要求 replay 时使用与捕获时相同的 GPU 地址。
+    此 buffer 在捕获前分配，replay 前将真实数据 copy 进来。
+    """
+
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
-    logits: torch.Tensor
+    logits: torch.Tensor   # 输出 buffer，replay 后结果写入此处
 
     @classmethod
     def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
@@ -76,6 +103,16 @@ def get_free_memory(device: torch.device) -> int:
 
 
 class GraphRunner:
+    """
+    CUDA Graph 运行器
+
+    管理 CUDA Graph 的完整生命周期：
+    - _capture_graphs: 捕获各 batch_size 的 graph（从大到小，共享 pool）
+    - can_use_cuda_graph: 判断 batch 是否可以走 graph 路径
+    - replay: 拷贝数据到 buffer 并 replay graph
+    - pad_batch: 将 batch 填充到最近的可用 graph batch_size
+    """
+
     def __init__(
         self,
         stream: torch.cuda.Stream,

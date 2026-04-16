@@ -1,3 +1,22 @@
+"""
+scheduler.py - 调度器核心
+
+本模块实现 Mini-SGLang 的核心调度循环，协调：
+- 接收用户请求（通过 SchedulerIOMixin）
+- 调度 prefill/decode batch（通过 PrefillManager/DecodeManager）
+- 管理 KV Cache（通过 CacheManager）
+- 驱动模型推理（通过 Engine）
+- 返回结果给 DeTokenizer
+
+两种调度模式：
+1. overlap_loop: 重叠调度，当前 batch 的 GPU 计算与上一 batch 的 CPU 后处理重叠
+2. normal_loop: 串行调度，用于调试（通过 DISABLE_OVERLAP_SCHEDULING 环境变量启用）
+
+数据流：
+  receive_msg → _process_one_msg → _schedule_next_batch → _prepare_batch
+  → _forward → _process_last_data → send_result
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
@@ -31,8 +50,8 @@ logger = init_logger(__name__)
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 
-# For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
+    """一次 forward 的输入，缓存所有张量以避免重叠调度时 IMA（Invalid Memory Access）"""
     batch: Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
@@ -43,6 +62,13 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
+    """
+    核心调度器
+
+    继承 SchedulerIOMixin 获得 ZMQ 通信能力，
+    持有 Engine、CacheManager、PrefillManager、DecodeManager。
+    """
+
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
 
@@ -136,6 +162,15 @@ class Scheduler(SchedulerIOMixin):
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
+        """
+        处理上一次 forward 的结果
+
+        1. 等待 GPU→CPU 拷贝完成
+        2. 将 next_token 追加到各请求的 input_ids
+        3. 判断是否完成（reach max_tokens 或 EOS）
+        4. 完成的请求释放资源，未完成的 prefill 请求缓存前缀
+        5. 发送回复给 DeTokenizer
+        """
         if last_data is None:
             return
 
@@ -202,6 +237,15 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        """
+        准备 batch 的所有输入张量
+
+        1. pad_batch: CUDA Graph 对齐
+        2. allocate_paged: 分配新的 KV Cache 页
+        3. 构造 positions, input_mapping, write_mapping
+        4. 计算 out_loc（token → KV Cache 位置映射）
+        5. prepare_metadata: 准备注意力后端元数据
+        """
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
@@ -234,6 +278,7 @@ class Scheduler(SchedulerIOMixin):
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """构造每个 token 的位置（用于 RoPE）: [cached_len, ..., device_len-1] for each req"""
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
     offset = 0
@@ -250,6 +295,7 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    """构造 (table_idx_mapping, positions) 用于从 token_pool 和 page_table 读取输入"""
     mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
@@ -260,6 +306,7 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    """构造 (req_mapping, write_positions) 用于将 next_token 写入 token_pool"""
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]

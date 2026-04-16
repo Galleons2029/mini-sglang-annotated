@@ -1,3 +1,18 @@
+"""
+embedding.py - 词嵌入层
+
+本模块实现支持 Tensor Parallel 的词嵌入层：
+
+1. VocabParallelEmbedding: 词表按列分片到各 TP rank
+   - 每个 GPU 只持有 vocab_size / tp_size 行的 embedding
+   - 通过 AllReduce 合并各 rank 的 lookup 结果
+
+2. ParallelLMHead: 语言模型头（embedding → logits）
+   - 支持 tie_word_embeddings（与 embedding 共享权重）
+   - 支持 bias
+   - 输出通过 AllGather 拼接各 rank 的 logits，裁剪到实际 vocab_size
+"""
+
 from __future__ import annotations
 
 from typing import Dict
@@ -12,6 +27,13 @@ from .base import BaseOP
 
 
 class VocabParallelEmbedding(BaseOP):
+    """
+    Vocab Parallel 词嵌入
+
+    将词表按行均分到各 TP rank。
+    每个 rank 只 lookup 自己负责范围内的 token，
+    超出范围的 token 结果为 0，通过 AllReduce 合并。
+    """
     def __init__(
         self,
         num_embeddings: int,
@@ -43,6 +65,14 @@ class VocabParallelEmbedding(BaseOP):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    """
+    语言模型输出头
+
+    继承自 VocabParallelEmbedding 复用权重管理。
+    prefill 阶段只取每个序列最后一个 token 的隐藏状态做 logits 计算。
+    TP > 1 时通过 AllGather 收集各 rank 的部分 logits 并裁剪。
+    支持 tie_word_embeddings：与 embed_tokens 共享权重。
+    """
     def __init__(
         self,
         num_embeddings: int,

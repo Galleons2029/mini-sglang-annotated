@@ -1,3 +1,23 @@
+"""
+launch.py - 服务启动器
+
+本模块负责启动 Mini-SGLang 的多进程架构：
+
+进程拓扑：
+  主进程 (API Server / Shell)
+    ├── Scheduler × tp_size  (每个 TP rank 一个进程)
+    ├── DeTokenizer × 1
+    └── Tokenizer × num_tokenizer
+
+启动流程：
+1. 解析命令行参数
+2. 启动所有子进程（Scheduler、Tokenizer、DeTokenizer）
+3. 等待所有子进程就绪（通过 multiprocessing.Queue）
+4. 启动 API Server 或 Shell
+
+进程间通信通过 ZMQ IPC 实现。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -14,6 +34,7 @@ if TYPE_CHECKING:
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
+    """Scheduler 子进程入口：初始化 → 同步 → 运行推理循环"""
     import torch
     from minisgl.scheduler import Scheduler
 
@@ -38,6 +59,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
 
 def launch_server(run_shell: bool = False) -> None:
+    """启动服务器：解析参数 → 创建子进程 → 运行 API Server 或 Shell"""
     from .api_server import run_api_server
     from .args import parse_args
 

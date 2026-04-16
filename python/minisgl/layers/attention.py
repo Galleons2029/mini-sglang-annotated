@@ -1,3 +1,17 @@
+"""
+attention.py - 注意力计算层
+
+本模块实现 AttentionLayer，将 QKV 投影结果经过 RoPE、注意力计算后输出。
+
+数据流：
+  qkv → split(Q, K, V) → [q_norm/k_norm] → RoPE → attention_backend.forward → output
+
+支持特性：
+- GQA: Q heads 可以多于 KV heads
+- Tensor Parallel: Q/KV heads 按 TP 分片
+- QK Norm: 可选的 Q/K 归一化（某些模型如 Qwen3 使用）
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -16,6 +30,12 @@ if TYPE_CHECKING:
 
 
 class AttentionLayer(StateLessOP):
+    """
+    注意力计算层（无参数）
+
+    接收合并的 QKV 张量，拆分后应用 RoPE 和注意力计算。
+    q_norm / k_norm 为可选的 QK 归一化层。
+    """
     def __init__(
         self,
         layer_id: int,

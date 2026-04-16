@@ -1,3 +1,29 @@
+"""
+api_server.py - 前端 API 服务器
+
+本模块实现 Mini-SGLang 的 HTTP API 和交互式 Shell：
+
+API 端点：
+- POST /generate: 简单文本生成（流式返回）
+- POST /v1/chat/completions: OpenAI 兼容的 Chat Completions API
+- GET /v1/models: 可用模型列表
+
+架构：
+  用户 → FastAPI → FrontendManager → [ZMQ] → Tokenizer → Scheduler
+
+FrontendManager 负责：
+1. 为每个请求分配唯一 uid
+2. 通过 ZMQ 将请求发送给 Tokenizer
+3. 异步监听 Tokenizer 返回的增量结果
+4. 通过 SSE (Server-Sent Events) 流式返回给用户
+5. 支持客户端断连时的请求取消
+
+交互式 Shell 模式：
+- 直接在终端与模型对话
+- 支持 /exit 和 /reset 命令
+- 自动维护对话历史
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -99,6 +125,13 @@ class ModelList(BaseModel):
 
 @dataclass
 class FrontendManager:
+    """
+    前端管理器
+
+    管理用户请求的生命周期：uid 分配 → 发送 → 监听回复 → 流式返回。
+    通过 ack_map + event_map 实现异步 uid→回复 的路由。
+    """
+
     config: ServerArgs
     send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]

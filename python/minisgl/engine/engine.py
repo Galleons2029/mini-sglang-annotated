@@ -1,3 +1,18 @@
+"""
+engine.py - 推理引擎
+
+本模块是 Mini-SGLang 的核心计算引擎，负责：
+1. 初始化 GPU 设备、模型、KV Cache、注意力后端、MoE 后端
+2. 管理 Page Table（token → KV Cache 位置映射）
+3. 捕获和管理 CUDA Graph
+4. 执行 forward + sampling
+
+初始化顺序：
+  设备 → 通信 → 模型 → KV Cache → Page Table → 注意力后端 → MoE → Sampler → CUDA Graph
+
+Engine 由 Scheduler 持有，Scheduler 调用 engine.forward_batch() 执行推理。
+"""
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -21,13 +36,16 @@ logger = init_logger(__name__)
 
 
 class ForwardOutput(NamedTuple):
-    next_tokens_gpu: torch.Tensor
-    next_tokens_cpu: torch.Tensor
-    copy_done_event: torch.cuda.Event
+    """forward_batch 的返回值，包含 GPU/CPU 两份 token 和同步事件"""
+
+    next_tokens_gpu: torch.Tensor       # GPU 端采样结果（用于写入 token_pool）
+    next_tokens_cpu: torch.Tensor       # CPU 端副本（用于 host 端处理）
+    copy_done_event: torch.cuda.Event   # GPU→CPU 拷贝完成的同步事件
 
 
 class Engine:
     def __init__(self, config: EngineConfig):
+        """初始化引擎：设备 → 通信 → 模型 → KV Cache → Page Table → 后端 → CUDA Graph"""
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
@@ -110,6 +128,12 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        """
+        初始化分布式通信
+
+        TP=1 或 use_pynccl 时：gloo 后端 + PyNCCL 自定义通信
+        否则：nccl 后端 + 额外 gloo 组用于 CPU 同步
+        """
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -146,6 +170,7 @@ class Engine:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+        """根据可用显存计算 KV Cache 页数（可通过 num_page_override 覆盖）"""
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
@@ -189,6 +214,7 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        """执行一次 forward（模型推理 + 采样），返回 GPU/CPU 端的 next_tokens"""
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
@@ -216,6 +242,13 @@ def _align_up_32(num: int) -> int:
 
 
 def _adjust_config(config: EngineConfig):
+    """
+    自动调整引擎配置
+
+    - attention_backend="auto": SM100+ → trtllm, SM90+ → fa,fi, 其他 → fi
+    - trtllm 后端强制 page_size=64
+    - MoE 模型自动选择 fused backend
+    """
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 

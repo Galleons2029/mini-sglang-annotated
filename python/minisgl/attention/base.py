@@ -1,3 +1,20 @@
+"""
+base.py - 注意力后端基类定义
+
+本模块定义注意力计算后端的抽象基类和混合后端。
+
+Mini-SGLang 支持多种注意力后端：
+- FlashInfer (FI): 基于 FlashInfer 库，支持 prefill 和 decode
+- FlashAttention (FA): 基于 FlashAttention 库，主要用于 prefill
+- TRT-LLM: 基于 TensorRT-LLM 的 XQA kernel，针对 SM100+ 优化
+- HybridBackend: 组合两个后端，prefill 和 decode 使用不同实现
+
+注意力后端职责：
+1. forward: 执行注意力计算
+2. prepare_metadata: 准备计算所需元数据
+3. init_capture_graph / prepare_for_capture / prepare_for_replay: CUDA Graph 支持
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -11,11 +28,17 @@ if TYPE_CHECKING:
 
 @dataclass
 class BaseAttnMetadata(ABC):
+    """注意力元数据基类，每个后端实现自己的元数据格式"""
+
     @abstractmethod
-    def get_last_indices(self, bs: int) -> torch.Tensor: ...
+    def get_last_indices(self, bs: int) -> torch.Tensor:
+        """获取每个序列最后一个 token 的索引，用于 LM Head 提取"""
+        ...
 
 
 class BaseAttnBackend(ABC):
+    """注意力后端抽象基类"""
+
     @abstractmethod
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -35,6 +58,15 @@ class BaseAttnBackend(ABC):
 
 
 class HybridBackend(BaseAttnBackend):
+    """
+    混合注意力后端
+
+    组合两个后端，根据 batch 阶段自动选择：
+    - prefill 阶段使用 prefill_backend（如 FA）
+    - decode 阶段使用 decode_backend（如 FI）
+    CUDA Graph 仅作用于 decode 后端。
+    """
+
     def __init__(
         self,
         prefill_backend: BaseAttnBackend,

@@ -1,3 +1,23 @@
+"""
+prefill.py - Prefill 阶段管理
+
+本模块实现 prefill 阶段的调度逻辑，包括：
+
+1. ChunkedReq: 分块请求（prompt 太长时分多次 prefill）
+2. PrefillAdder: 在 token_budget 和 cache 容量内贪心地添加请求
+3. PrefillManager: 管理 pending 请求列表，调度 prefill batch
+
+分块 Prefill (Chunked Prefill):
+- 当 prompt 长度超过 token_budget 时，只处理前 chunk_size 个 token
+- ChunkedReq 标记为 can_decode=False，不会进入 decode 阶段
+- 下一轮调度时继续处理剩余部分
+
+容量估算：
+- 需要 extend_len（本次计算量）+ output_len（预留 decode 空间）
+- 扣除 decode_manager.inflight_tokens（已在 decode 的请求预留）
+- 扣除已分配的 cache 空间
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -21,6 +41,7 @@ logger = init_logger(__name__)
 
 
 class ChunkedReq(Req):
+    """分块请求：prompt 分多次 prefill，中间不采样也不进入 decode"""
     def append_host(self, next_token: torch.Tensor) -> None:
         raise NotImplementedError("ChunkedReq should not be sampled")
 
@@ -31,6 +52,12 @@ class ChunkedReq(Req):
 
 @dataclass
 class PrefillAdder:
+    """
+    Prefill 请求添加器
+
+    在 token_budget 和 cache 容量约束下，贪心地将 pending 请求加入 batch。
+    通过 cache_manager.match_req 查询前缀缓存命中，减少实际计算量。
+    """
     token_budget: int
     reserved_size: int
     cache_manager: CacheManager
@@ -115,6 +142,12 @@ class PrefillAdder:
 
 @dataclass
 class PrefillManager:
+    """
+    Prefill 管理器
+
+    维护 pending_list（等待 prefill 的请求队列），
+    每次调度时通过 PrefillAdder 贪心地选择请求组成 batch。
+    """
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager

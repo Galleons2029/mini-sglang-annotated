@@ -1,3 +1,22 @@
+"""
+linear.py - 线性层（Tensor Parallel）
+
+本模块实现各种 Tensor Parallel 策略的线性层：
+
+1. _LinearTPImpl: 基础实现，管理 local 权重
+2. LinearReplicated: 不分片，每个 GPU 持有完整权重
+3. LinearColParallelMerged: 列并行（output 维分片），支持合并多个输出
+4. LinearQKVMerged: QKV 合并投影（Q/K/V 各自按 TP 分片后合并）
+5. LinearOProj: O 投影（input 维分片 + AllReduce）
+6. LinearRowParallel: 行并行（input 维分片 + AllReduce）
+
+Tensor Parallel 策略：
+- 列并行（Column）: weight 按 output 维分片，无需通信
+  用于：QKV 投影、Gate/Up 投影
+- 行并行（Row）: weight 按 input 维分片，forward 后 AllReduce
+  用于：O 投影、Down 投影
+"""
+
 from __future__ import annotations
 
 from typing import List
@@ -11,7 +30,7 @@ from .base import BaseOP
 
 
 class _LinearTPImpl(BaseOP):
-    """Real implementation of a linear layer with tensor parallelism."""
+    """线性层基础实现，存储 local 大小的 weight 和可选的 bias"""
 
     def __init__(
         self,
@@ -54,6 +73,7 @@ class LinearReplicated(_LinearTPImpl):
 
 
 class LinearColParallelMerged(_LinearTPImpl):
+    """列并行合并线性层：多个输出（如 gate + up）按 TP 分片后合并为一个 weight"""
     def __init__(
         self,
         input_size: int,
@@ -69,6 +89,7 @@ class LinearColParallelMerged(_LinearTPImpl):
 
 
 class LinearQKVMerged(_LinearTPImpl):
+    """QKV 合并投影：Q/K/V 各按 TP 分片后拼接为单个 weight，一次矩阵乘法完成"""
     def __init__(
         self,
         hidden_size: int,
@@ -89,6 +110,7 @@ class LinearQKVMerged(_LinearTPImpl):
 
 
 class LinearOProj(_LinearTPImpl):
+    """O 投影：input 按 TP 分片，forward 后 AllReduce 合并"""
     def __init__(self, input_size: int, output_size: int, has_bias: bool):
         tp_info = get_tp_info()
         full_isize = input_size
@@ -107,6 +129,7 @@ class LinearOProj(_LinearTPImpl):
 
 
 class LinearRowParallel(_LinearTPImpl):
+    """行并行线性层：input 按 TP 分片，forward 后 AllReduce 合并"""
     def __init__(
         self,
         input_size: int,

@@ -1,3 +1,32 @@
+"""
+radix_cache.py - 基于 Radix Tree 的前缀缓存
+
+本模块实现 Radix Tree（基数树）结构的 KV Cache 前缀缓存，
+用于在不同请求间复用共享的 prompt 前缀。
+
+核心思想：
+- 将 token 序列组织为 Radix Tree，相同前缀共享 KV Cache
+- 例如：两个请求 "Hello World A" 和 "Hello World B"
+  共享 "Hello World" 部分的 KV Cache
+
+Radix Tree 结构：
+  root
+  └── [Hello, World]  (shared prefix)
+      ├── [A]          (request 1)
+      └── [B]          (request 2)
+
+每个节点存储：
+- key: token IDs
+- value: 对应的 KV Cache page 索引
+- ref_count: 引用计数（>0 表示被活跃请求使用，不可驱逐）
+- timestamp: 最后访问时间（用于 LRU 驱逐）
+
+缓存管理策略：
+- 插入时按 page_size 对齐
+- 驱逐时使用最小堆按 timestamp 排序，优先驱逐最久未访问的叶节点
+- 叶节点驱逐后，父节点如果也无引用则递归入堆
+"""
+
 from __future__ import annotations
 
 import heapq
@@ -15,6 +44,13 @@ KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 
 
 class RadixTreeNode:
+    """
+    Radix Tree 节点
+
+    每个节点存储一段 token 序列（key）及其对应的 KV Cache 索引（value）。
+    通过 children dict 形成树结构，key_fn 提取首 token/page 作为分支键。
+    """
+
     counter: int = 0
 
     def __init__(self, key_fn: KEY_FN, tic: int | None = None) -> None:
@@ -67,6 +103,7 @@ class RadixTreeNode:
         return fast_compare_key(self._key, input_ids)
 
     def split_at(self, pos: int) -> RadixTreeNode:
+        """在 pos 处分裂节点，返回新的父节点（原节点变为子节点）"""
         assert 0 < pos < self.length
         parent = self.parent
 
@@ -99,6 +136,15 @@ class RadixCacheHandle(BaseCacheHandle):
 
 
 class RadixPrefixCache(BasePrefixCache):
+    """
+    基于 Radix Tree 的前缀缓存
+
+    维护一棵 Radix Tree 和两个大小计数器：
+    - evictable_size: 可驱逐的 token 数（ref_count=0 的节点）
+    - protected_size: 受保护的 token 数（ref_count>0 的节点）
+    root 节点 ref_count=1，始终受保护不会被驱逐。
+    """
+
     def __init__(self, device: torch.device):
         super().__init__()
         self.device = device
@@ -111,6 +157,7 @@ class RadixPrefixCache(BasePrefixCache):
         self.root_node.ref_count = 1  # root is always protected
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
+        """锁定/解锁缓存句柄：沿路径递增/递减 ref_count，更新 evictable/protected 计数"""
         assert isinstance(handle, RadixCacheHandle)
         node = handle.node
         if unlock:
@@ -146,6 +193,7 @@ class RadixPrefixCache(BasePrefixCache):
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
 
     def evict(self, size: int) -> torch.Tensor:
+        """驱逐至少 size 个 token 的缓存，返回被释放的 KV Cache 索引"""
         if size == 0:
             return self.empty_tensor
         assert (
@@ -203,6 +251,7 @@ class RadixPrefixCache(BasePrefixCache):
         return leave_nodes
 
     def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+        """沿树匹配 input_ids，返回 (最深匹配节点, 匹配长度)"""
         prefix_len = 0
         indice_len = len(input_ids)
         node = self.root_node
@@ -231,6 +280,7 @@ class RadixPrefixCache(BasePrefixCache):
 
 
 def _get_key_fn(page_size: int) -> KEY_FN:
+    """根据 page_size 选择分支键函数：page_size=1 用单 token，否则用 tuple"""
     if page_size == 1:
         return lambda x: x[0].item()
     return lambda x: tuple(x[:page_size].tolist())

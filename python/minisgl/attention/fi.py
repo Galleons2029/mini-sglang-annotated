@@ -1,3 +1,22 @@
+"""
+fi.py - FlashInfer 注意力后端实现
+
+本模块基于 FlashInfer 库实现 Paged Attention 后端，
+支持 prefill 和 decode 两个阶段。
+
+核心类：
+- FIMetadata: FlashInfer 元数据（cu_seqlens、page indices 等）
+- FlashInferBackend: 后端实现，管理 FlashInfer wrapper 的生命周期
+
+关键设计：
+1. page_size=1: 当前仅支持 page_size=1 的 Paged KV Cache
+2. 延迟初始化: metadata 的 plan() 在首次 forward 时调用，
+   利用 non_blocking H2D copy 与 GPU 计算重叠
+3. CUDA Graph: 通过 CUDAGraphBatchDecodeWithPagedKVCacheWrapper 实现，
+   预分配固定 batch size 的 buffer
+4. int_workspace_buffer 复用: prefill/decode wrapper 共享同一块 workspace
+"""
+
 from __future__ import annotations
 
 import math
@@ -34,9 +53,11 @@ logger = init_logger(__name__)
 
 @dataclass
 class FICaptureData(BaseCaptureData):
+    """FlashInfer CUDA Graph 捕获数据，复用 BaseCaptureData 的 seq_lens 和 page_table"""
+
     @property
     def one_tensor(self) -> torch.Tensor:
-        return self.seq_lens
+        return self.seq_lens  # page_size=1，last_page_len 全为 1
 
     @property
     def indices(self) -> torch.Tensor:
@@ -45,21 +66,28 @@ class FICaptureData(BaseCaptureData):
 
 @dataclass
 class FIMetadata(BaseAttnMetadata):
+    """
+    FlashInfer 注意力元数据
+
+    存储 FlashInfer wrapper.plan() 和 wrapper.run() 所需的所有参数。
+    注意 CPU/GPU 张量的分布：CPU 端用于 plan()（H2D 异步拷贝），GPU 端用于 run()。
+    """
+
     # fmt: off
-    cu_seqlens_q_cpu:   torch.Tensor  # on cpu
-    cu_seqlens_k_cpu:   torch.Tensor  # on cpu
-    cu_seqlens_q_gpu:   torch.Tensor  # on gpu
-    indices:            torch.Tensor  # on gpu
-    last_page_len_cpu:  torch.Tensor  # on cpu
+    cu_seqlens_q_cpu:   torch.Tensor  # Q 的累积序列长度（CPU, pinned）
+    cu_seqlens_k_cpu:   torch.Tensor  # K 的累积序列长度（CPU, pinned）
+    cu_seqlens_q_gpu:   torch.Tensor  # Q 的累积序列长度（GPU），用于 get_last_indices
+    indices:            torch.Tensor  # KV cache page 索引（GPU）
+    last_page_len_cpu:  torch.Tensor  # 每个序列最后一页的有效长度（CPU），page_size=1 时全为 1
     num_qo_heads:       int
     num_kv_heads:       int
     head_dim:           int
-    page_size:          Literal[1] # currently only support page_size=1
-    pos_encoding_mode:  str
-    seq_lens_cpu:       torch.Tensor  # on cpu
+    page_size:          Literal[1] # 当前仅支持 page_size=1
+    pos_encoding_mode:  str         # "NONE"：RoPE 在 attention 外部已应用
+    seq_lens_cpu:       torch.Tensor  # 每个序列的 K 长度（CPU）
     dtype:              torch.dtype
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
-    initialized:        bool = False
+    initialized:        bool = False  # plan() 是否已调用
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -78,6 +106,19 @@ class FIMetadata(BaseAttnMetadata):
 
 
 class FlashInferBackend(BaseAttnBackend):
+    """
+    FlashInfer 注意力后端
+
+    使用 FlashInfer 的 BatchPrefillWithPagedKVCacheWrapper 和
+    BatchDecodeWithPagedKVCacheWrapper 实现高效的 paged attention。
+
+    性能要点：
+    - 使用 fa2 backend（FlashInfer fa3 较慢）
+    - GQA >= 4 时启用 tensor cores（可通过环境变量覆盖）
+    - plan() 使用 non_blocking=True，与 GPU 计算重叠
+    - 通过 last_event 同步，避免 plan 的 pinned buffer 被覆盖
+    """
+
     def __init__(self, config: ModelConfig) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
@@ -121,6 +162,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.last_event.record()
 
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
+        """延迟调用 wrapper.plan()，确保上一次 plan 的 H2D copy 已完成"""
         if metadata.initialized:
             return
 
@@ -188,6 +230,14 @@ class FlashInferBackend(BaseAttnBackend):
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     def prepare_metadata(self, batch: Batch) -> None:
+        """
+        准备 FlashInfer 元数据
+
+        根据 batch 类型构造不同的 cu_seqlens_q：
+        - decode（全部 extend_len=1）: 简单的 arange
+        - prefill 无 cache hit: cu_seqlens_q == cu_seqlens_k
+        - prefill 有 partial cache hit: 单独计算
+        """
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)

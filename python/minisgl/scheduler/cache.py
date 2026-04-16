@@ -1,3 +1,20 @@
+"""
+cache.py - KV Cache 分配与管理
+
+本模块实现 CacheManager，负责：
+1. 管理 KV Cache 的空闲页（free_slots）
+2. 与前缀缓存（prefix_cache）协作，实现缓存复用
+3. 按 page 对齐分配和释放 KV Cache 空间
+4. 将分配的 page 写入 page_table
+
+页对齐策略：
+- free_slots 存储 page 起始位置（如 page_size=2: [0, 2, 4, 6, ...]）
+- 分配时以 page 为单位，然后展开为 token 级别的位置
+- 释放时只需存储每页的起始位置（indices[::page_size]）
+
+缓存容量 = 空闲页 + 可驱逐的前缀缓存页
+"""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -13,6 +30,12 @@ if TYPE_CHECKING:
 
 
 class CacheManager:
+    """
+    KV Cache 管理器
+
+    协调 free_slots（空闲页池）和 prefix_cache（前缀缓存树）。
+    支持通过 lazy_free_region 批量延迟释放，减少碎片化操作。
+    """
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
@@ -40,6 +63,7 @@ class CacheManager:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
+        """为请求列表分配新的 KV Cache 页，并写入 page_table"""
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
@@ -92,6 +116,7 @@ class CacheManager:
 
     @contextmanager
     def lazy_free_region(self):
+        """延迟释放区域：region 内所有 _free 调用被缓存，退出时一次性合并到 free_slots"""
         def lazy_free(indices: torch.Tensor) -> None:
             lazy_free_list.append(indices[:: self.page_size])
 
@@ -125,6 +150,7 @@ class CacheManager:
 
 
 def _write_page_table(
+    # 将分配的 token 位置写入 page_table，使用 pin_memory + non_blocking 加速 H2D
     page_table: torch.Tensor,
     allocated: torch.Tensor,
     allocation_info: List[Tuple[int, int, int]],
